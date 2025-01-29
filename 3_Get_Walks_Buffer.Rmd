@@ -1,0 +1,75 @@
+---
+title: "3. Get walks within buffers"
+author: "Esteban Moro"
+date: '2022-04-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(Rcpp)
+library(zoo)
+library(anytime)
+library(stringr)
+```
+
+
+# Introduction 
+
+In this script we check whether the walks happen in the walkable buffer areas and get only those that have the majority of points within those areas. 
+
+# Load data 
+
+First we load the walks detected
+
+```{r}
+require(data.table)
+require(tidyverse)
+require(sf)
+walks <- fread("./data/walks.csv.gz")
+coords_walk <- st_as_sf(walks,coords=c("lon","lat"),crs=4326)
+```
+
+Get the county subdivisions within the Boston Metro area (they are in the states of MA and NH)
+```{r,message=F,warning=F,results=F}
+require(tigris)
+cbsas <- core_based_statistical_areas(class="sf")
+boston_metro <- cbsas[cbsas$GEOID=="14460",] %>%
+  st_transform(crs=4326)
+cts <- map_dfr(c("MA","NH"),~{
+  county_subdivisions(.x, cb = TRUE, year = 2020)
+  }) %>%
+  st_transform(crs=4326) %>%
+  st_intersection(boston_metro)
+```
+
+# Check walks within buffer
+
+We go over the differen county subdivisions buffers (calculated in `2_Get_walkable_areas.Rmd`) to check if the points in them are within the walkable buffers.
+```{r,message=F,warning=F}
+walks_new <- walks
+walks_new$buffer <- 0
+for(i in 1:nrow(cts)){
+  cts_selected <- cts[i,]
+  file_buffer <- paste0("./data/buffer_14460_",cts_selected$GEOID,".RData")
+  load(file_buffer)
+  within_id <- st_within(coords_walk,buffer_simplified)
+  ii <- which(as.numeric(within_id)==1)
+  if(length(ii)>0) walks_new$buffer[ii] <- 1
+}
+```
+
+# Select only walks with more the 75% points in walkable areas
+
+```{r}
+walks_new[,fraction:=sum(buffer)/.N,.(walkNum)]
+walks_new <- walks_new[fraction > .75]
+```
+
+Save final set of walks
+```{r}
+fwrite(walks_new,file="./data/walks_final.csv.gz")
+```
+
+

@@ -1,0 +1,200 @@
+---
+title: "1. Get all Walks"
+author: "Esteban Moro"
+date: '2022-04-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(Rcpp)
+library(zoo)
+library(anytime)
+library(stringr)
+```
+
+
+# Introduction 
+
+In this script we extract all the potential walks from the raw mobility data (pings)
+
+
+# Load Functions
+
+First we load the scripts that contain the functions in R and C++ that we are going to use to detect the walks in the mobility data
+
+```{r}
+fileNameCpp <- "./scripts/0-func.cpp"
+fileNameFunc <- "./scripts/0-func.R"
+```
+
+Create functions
+```{r}
+sourceCpp(fileNameCpp)
+source(fileNameFunc)
+```
+
+
+# Load mobility data
+
+The mobility data was preprocessed to group all pings of a single user in the same file. **Note:** the data is not available in this repository. Please contact the authors for more information or your data provider to get it. 
+
+```{r}
+fileNameIn <- "./data/pings_users.txt.gz"
+```
+
+Load the data
+```{r}
+DTClean1 <- fread(fileNameIn)
+head(DTClean1)
+```
+Change the names of the columns
+```{r}
+colNamesNew <- c("userId","lat","lon","accuracy","ts","time","class")
+setnames(DTClean1, colNamesNew)
+```
+
+
+# Phase 1 :: Clean the data
+
+Remove personal area
+```{r}
+DTClean1 <- DTClean1[class!="PERSONAL_AREA"]
+```
+
+Sort by user and time
+```{r}
+setkey(DTClean1,userId,time)
+```
+
+The we filter out bad data:
+
+- Duplicates
+```{r}
+DTClean1 <- unique(DTClean1, by=c("userId", "time"))
+```
+
+- Remove errors in lat lon
+```{r}
+DTClean1 <- DTClean1[lat > 1 & lon < -1,]
+```
+
+- Find number of days each user is recorded for and number of points
+```{r}
+DTClean1[, c('numDaysActive', 'numPoints') := .(length(unique(anydate(time))), .N), by = userId]
+```
+
+- Eliminate inaccurate points.
+```{r}
+DTClean1 <- DTClean1[accuracy < 200,]
+```
+
+- Eliminate still points
+```{r}
+DTClean1 <- DTClean1[!(makeLoIsStill(DTClean1))]
+```
+
+- Eliminate quick jumps repeatedly
+```{r}
+DTClean1 <- RemoveJumps(DTClean1)
+```
+
+- Eliminate new still points
+```{r}
+DTClean1 <- DTClean1[!(makeLoIsStill(DTClean1))] 
+```
+
+
+# Phase 2 :: Find walks
+
+Recalculate dist, velocity and angle columns
+```{r}
+DTClean1[, dist := haverDistVector(lon, lat), by=userId]
+DTClean1[1, dist := 0, by=userId]
+DTClean1[, vel := dist/(time-shift(time)), by = userId]
+DTClean1[, angle := findAngVector(lon, lat, dist), by=userId]
+```
+
+Set NAs to 0.
+```{r}
+DTClean1[1, c('vel', 'angle'):= 0, by=userId]
+DTClean1[.N, angle := 0, by=userId]
+```
+
+
+Find walks betwen minSpeed (in m/s) and maxSpeed
+```{r}
+minSpeed = 0.5
+maxSpeed = 2
+DTClean1[, isNewWalk := ((vel < minSpeed) | (vel > maxSpeed))]
+```
+
+Remove walks of length 2 by eliminating the middle of TFT and TTT
+```{r}
+DTClean1 <- DTClean1[!(shift(isNewWalk) & shift(isNewWalk, type='lead')),]
+```
+
+Remove walks of lenghth 1 by eliminating the first of TT
+```{r}
+DTClean1 <- DTClean1[!(isNewWalk & shift(isNewWalk, type='lead')),]
+```
+
+Name the walks
+```{r}
+DTClean1[(isNewWalk), walkNum := .I]
+DTClean1[1,walkNum:=0,by=userId]
+DTClean1[, walkNum := na.locf(walkNum)]
+```
+
+Determine if the walks are acceptable
+```{r}
+minAngle = 15/180*pi
+maxDist = 1500
+DTClean1[, isAngleTooSmall := angle < minAngle]
+```
+
+Ignores first point of walk's weirdness because that dist isn't part of the walk
+```{r}
+DTClean1[, isDistTooLong := dist > maxDist & !isNewWalk]
+```
+
+Also ignores first and last points in walk's angle, as that isn't apart of the walk. This line of code is separate to deal with tricky NA stuff. Basically some angles are NaN because they're at the start or end of a user, and don't have enough points to calculate. Those are fine and are dealt with by the next line, but angles are NAs for other reasons, so keep those marked as NA so that we can mark them as non-walks.
+```{r}
+DTClean1[isNewWalk | shift(isNewWalk, type='lead'), isAngleTooSmall := FALSE]
+```
+
+Give an ID for walks and non-walks
+```{r}
+DTClean1[, isInWalk := !(any(isDistTooLong) |
+                        sum(isAngleTooSmall) > 1 |
+                        (.N==3 & any(isAngleTooSmall)) |
+                        any(is.na(isAngleTooSmall))),
+          by=walkNum]
+```
+
+
+Remove non-walks
+```{r}
+DTClean1 <- DTClean1[(isInWalk),]
+```
+
+Set beginning of walks dist, vel, and angle to NA and end of walks angle to NA
+```{r}
+DTClean1[(isNewWalk), c('angle', 'dist', 'vel') := NA]
+DTClean1[shift(isNewWalk, type = 'lead'), angle:=NA]
+numRows <- DTClean1[, .N]
+DTClean1[numRows, angle:=NA]
+```
+
+Remove useless columns
+```{r}
+DTClean1 <- DTClean1[, .(userId, walkNum, lat, lon, time, ts, dist, vel, angle)]
+```
+
+Write the file with the walks
+```{r}
+fileNameOut <- "./data/walks.csv.gz"
+fwrite(DTClean1,file=fileNameOut)
+```
+

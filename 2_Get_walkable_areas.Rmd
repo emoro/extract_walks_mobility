@@ -1,0 +1,156 @@
+---
+title: "2. Get Walkable areas"
+author: "Esteban Moro"
+date: '2022-04-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(tidyverse)
+library(tigris)
+```
+
+# Introduction 
+
+In this script we use Open Street maps to find all the walkable areas in a metropolitan area. In this case we are going to do it in the Boston Metro area
+
+# Get the metro area for Boston
+
+First we load the core based statistica area around Boston
+```{r,results = "hide", message = FALSE, warning = FALSE}
+require(tigris)
+require(sf)
+require(tidyverse)
+cbsas <- core_based_statistical_areas(class="sf",)
+boston_metro <- cbsas[cbsas$GEOID=="14460",] %>%
+  st_transform(crs=4326)
+```
+
+Let's see it
+```{r}
+ggplot(boston_metro) + geom_sf()
+```
+
+
+
+# Get the secondary and residential roads
+
+Using Open Street Map get the secondary roads. We select only the secondary, local and park areas. Warning: the files downloaded from OSM are large. We might want to save the for future use.
+
+```{r,eval=F}
+require(osmdata)
+highway_secondary <- st_bbox(map) %>%
+    opq(timeout=20000)%>%
+    add_osm_feature(key = "highway", 
+                    value = c("secondary", "tertiary",
+                              "secondary_link","tertiary_link")) %>%
+    osmdata_sf()
+```
+
+We might want to save this file for future use
+```{r,eval=F}
+file_secondary <- "./data/14460_secondary.RData"
+save(highway_secondary,file=file_secondary)
+```
+
+```{r load_seconday,echo=F}
+load("./data/14460_secondary.RData")
+```
+
+Now we get the local streets
+```{r,eval=F}
+highway_local <- st_bbox(map) %>%
+  opq(timeout=20000)%>%
+  add_osm_feature(key = "highway", 
+                  value = c("residential", "living_street",
+                            #"service","unclassified",
+                            "cycleway",
+                            "pedestrian", "footway","track","path"
+                  )
+  ) %>%
+  osmdata_sf()
+```
+
+We might want to save this file for future use
+```{r,eval=F}
+file_local <- "./data/14460_local.RData"
+save(highway_local,file=file_local)
+```
+
+```{r load_local,echo=F}
+load("./data/14460_local.RData")
+```
+
+And finally we get the polygons for the parks, where walks are also possible.
+```{r,eval=F}
+parks <-  st_bbox(map) %>% 
+  opq(timeout=20000) %>%
+  add_osm_feature(key = "leisure",
+                  value = c("park","playground","golf_course",
+                            "nature_reserve")
+  )%>% 
+  osmdata_sf()
+```
+We might want to save this file for future use
+```{r,eval=F}
+file_parks <- "./data/14460_parks.RData"
+save(parks,file_parks)
+```
+
+```{r load_parks,echo=F}
+load("./data/14460_parks.RData")
+```
+
+
+# Get the walkable areas by county subdivision
+
+We now calculate a buffer around those streets, paths and parks of 20 meters to get the polygon within which walks are possible. 
+Given that the calculations are complex and big, we split the buffer calculation by census county subdivision.
+
+Get the county subdivisions within the Boston Metro area (they are in the states of MA and NH)
+```{r,message=F,warning=F,results=F}
+cts <- map_dfr(c("MA","NH"),~{
+  county_subdivisions(.x, cb = TRUE, year = 2020)
+  }) %>%
+  st_transform(crs=4326) %>%
+  st_intersection(boston_metro)
+```
+
+Now we get the buffer by census tract
+```{r,message=F,warning=F,results=F}
+for(i in 1:nrow(cts)){
+
+  #select the polygon 
+  cts_selected <- cts[i,]
+
+  #buffer a little bit around it (500 meters)
+  cts_selected <- st_buffer(cts_selected,dist=500*1e-5)
+  
+  #intersect streets and parks with county boundaries
+  cts_hs <- st_intersection(highway_secondary$osm_lines,cts_selected)
+  cts_hl <- st_intersection(highway_local$osm_lines,cts_selected)
+  cts_pk <- st_intersection(parks$osm_polygons,cts_selected)
+  
+  #get 20 meters buffers around them
+  buffer_hs <- st_buffer(cts_hs,dist=20*1e-5)
+  buffer_hl <- st_buffer(cts_hl,dist=20*1e-5)
+  buffer_pk <- st_buffer(cts_pk,dist=20*1e-5)
+
+  #join all the buffers into one polygon
+  buffer_total <- rbind(buffer_hs[,c("osm_id","name","geometry")],
+                        buffer_hl[,c("osm_id","name","geometry")],
+                        buffer_pk[,c("osm_id","name","geometry")])
+  buffer <- st_union(buffer_total)
+  
+  #remove small holes in the total buffer polygon 
+  require(nngeo)
+  buffer_simplified <- nngeo::st_remove_holes(buffer,max_area=(200*1e-5)^2)
+  
+  #save the buffer for future use
+  fileOut <- paste0("./data/buffer_14460_",cts_selected$GEOID,".RData")
+  save(buffer_simplified,file=fileOut)
+}
+```
+
